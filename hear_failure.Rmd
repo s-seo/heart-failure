@@ -1,0 +1,336 @@
+---
+title: "HF"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+*유진쌤이 하던 작업을 서포트하는 것이 배경*
+*분석의 목적은 phenomapping 논문과 비슷한 분석을 해볼 수 있지 않을까해서*
+*clustering analysis를 해본다는 것*
+*만약 환자 간 군집을 나눈다면? 이미 병에 걸린 환자를 진단해서 입원시킨 후의*
+*데이터다.*
+
+*내가 생각했을 때, 군집을 나누는 배경이 되는 사건은 매우 다양하고, 많은*
+*연구가 진행되어 왔을것. 우리가 하려는 분석의 목적이 무엇인지 정확히 따져야*
+*하지만, 분석의 시작점은 어디까지나 유진쌤 서포트*
+
+*일단, 빠른 시일 내에 입원했을 당시 환자의 상태를 가지고 군집을 나눠볼것*
+
+
+*패키지, 데이터, 함수*
+```{r}
+options(java.parameters = "- Xmx1024m")
+lapply(c('dplyr',
+         'data.table',
+         'reshape',
+         'XLConnect',
+         'rowr',
+         'lubridate',
+         'ggplot2',
+         'gridExtra',
+         'missForest'), require, character.only=T)
+
+read.xls <- function(filename, sheetnumber=1, sheetname=NULL, forceConversion=TRUE, startCol=0,  stringsAsFactors=TRUE) {
+  wb <- loadWorkbook(filename)
+  if (is.null(sheetname)) sheetname = getSheets(wb)[sheetnumber]
+  df <- readWorksheet(wb, sheet=sheetname, forceConversion=forceConversion, startCol=startCol)
+  if (stringsAsFactors) {
+    ischar <- sapply(df, class) == "character"
+    for (i in 1:length(df)) {
+      if (ischar[i]) df[,i] <- factor(df[,i])
+    }
+  }
+  df
+}
+
+levct <- function(data, level){
+  data <- data %>% as.data.frame()
+  sf <- sapply(data, FUN = is.factor) %>% as.data.frame()
+  ss <- sapply(sapply(data, levels), length) %>% as.data.frame()
+  rn <- rownames(sf)[sf[,1] == 'TRUE' & ss[,1] < as.numeric(level) ]
+  res <- c()
+  
+  for(i in seq_along(rn)){
+    cb <- data[,rn[i]] %>% table() %>% as.data.frame() %>% arrange(desc(.)) %>% rename(c(.=rn[i]))
+    res <- cbind.fill(res, cb, fill='')
+  }
+  res <- res[,-1]
+  return(res)
+}
+
+setwd('C:\\Users\\sseo\\Desktop\\R\\HF')
+hf <- read.xls('KORAHF_ML_FINAL_Dataset.xlsx', sheetnumber = 1)
+hf2 <- read.csv('KORAHF_0227_death.csv')
+hf3 <- read.csv('KorAHF_2018_12_19_SNUBH_SNUH_SNU_AI_연구_EPI.csv')
+```
+
+*table view*
+```{r}
+#structure
+c.hf <- colnames(hf) ; c.hf2 <- colnames(hf2) ; c.hf3 <- colnames(hf3)
+cbind(c.hf, c.hf %in% c.hf2, c.hf %in% c.hf3, 
+      lapply(1:ncol(hf), function(i) class(hf[,i])) %>% unlist()) %>% 
+  as.data.frame() %>%
+  mutate(c.hf = as.character(c.hf),
+         V2 = as.logical(V2),
+         V3 = as.logical(V3),
+         Na = rowSums(is.na(t(hf)))) %>%
+  mutate(c.hf2 = ifelse(V2, c.hf, NA),
+         c.hf3 = ifelse(V3, c.hf, NA)) %>%
+  select(c.hf, c.hf2, c.hf3, V4, Na) %>%
+  rename(c(V4='class')) %>%
+  View('HF_structure')
+
+#파생변수
+cbind.fill(c.hf2[!c.hf2 %in% c.hf], c.hf3[!c.hf3 %in% c.hf], fill=" ") %>%
+  View('derivative')
+
+#level count
+hf %>%
+  mutate_if(is.numeric, as.factor) %>%
+  levct(., 100) %>%
+  t() %>%
+  View('level count')
+
+#Date
+hf %>% select(Adm_date, Dx_date, EKG_date, lab_date, Echo_date, base_DC_dt, 
+              FU_date, DCDT) %>% View('Date')
+```
+
+
+```{r}
+ggplot(hf, aes(x=AGE)) +
+  geom_density()
+
+hf[(hf$HTN + hf$HTN_new) == '3',] %>% View()
+
+
+install.packages("PerformanceAnalytics")
+library("PerformanceAnalytics")
+chart.Correlation(hf %>% select(Lung_Cong:CRT_yn) %>% mutate_if(is.factor, as.numeric), histogram = T)
+```
+
+*select / missing value imputation*
+```{r}
+hf4 <- hf %>%
+  select(SEX, AGE, Ht:BMI, smoking, alcohol, SBP:HR, EKG_QRSdur:EKG_HR,
+         WBC:glucose, LVEDD:E_over_Eprime) %>%
+  select(-HbA1c_7_new, -NoDM_DM_7.0, -HbA1c, -(TG:LDLcal), -RDW,) %>%
+  mutate(SEX = as.factor(SEX),
+         smoking = as.factor(smoking),
+         alcohol = as.factor(alcohol)) 
+
+#Ht~BMI
+#SBP~HR
+#EKG
+#WBC~Platelet
+#TC with other variables. correlation
+#TC~glucose
+#LV~LA
+#wave
+
+#Multiple imputation의 경우, 위 데이터는 MAR 가정을 충족하지 못하므로 사용 불가.
+#epsilon을 사용하는 방안?
+
+#Amelia라는 패키지도 있다. 
+#It is enabled with bootstrap based EMB algorithm which makes it faster 
+#and robust to impute many variables including cross sectional, 
+#time series data etc. Also, it is enabled with parallel imputation feature 
+#using multicore CPUs
+#이 방법은 MVN 가정이 필요한데, 변수마다 확인하기 어려워 보류
+
+#builds a random forest model for each variable. Then it uses the model to
+#predict missing values in the variable with the help of observed values.
+hf4.imp <- missForest(hf4, mtry = 10, ntree = 300)
+hf4.imp$OOBerror #33% error
+
+hf.imp <- hf4.imp$ximp
+
+
+library('orclus')
+hf.imp <- hf.imp %>% mutate_if(is.factor, as.numeric)
+orclus.res <- orclus(x = hf.imp, k = 5, l = 4, k0 = 15, a = 0.75)
+orclus.res$cluster %>% table()
+
+dst <- dist(hf.imp, method = 'euclidean')
+install.packages('clValid')
+library('clValid')
+dunn(dst, orclus.res$cluster)
+
+
+install.packages('clv')
+library(clv)
+
+cls.scatt <- cls.scatt.data(hf.imp, orclus.res$cluster, dist='manhattan')
+cls.scatt %>% View()
+intraclust = c("complete","average","centroid")
+interclust = c("single", "complete", "average","centroid", "aveToCent", "hausdorff")
+davies <- clv.Davies.Bouldin(cls.scatt, intraclust, interclust)
+View(davies)
+dunn1 <- clv.Dunn(cls.scatt, intraclust, interclust)
+write.csv(hf5,'C:\\Users\\sseo\\Desktop\\R\\HF\\hf_sm.csv')
+
+library(ellipse)
+source('my_plotcorr.R')
+corr <- cor(cbind(hf.imp,orclus.res$cluster))
+corr[1,]
+my.plotcorr(corr)
+
+hf5 <- cbind(hf.imp, orclus.res$cluster)
+colnames(hf5)[45] <- 'class'
+library(randomForest)
+hf.rf <- randomForest(class~., hf5, importance=TRUE, proximity=TRUE)
+hf.ip <- round(importance(hf.rf), 2) %>% as.data.frame()
+colnames(hf.ip) <- c("MSE", 'Purity')
+hf.ip %>% mutate(var = rownames(hf.ip)) %>% arrange(desc(MSE)) %>% View()
+
+
+
+hf %>%
+  mutate(inst = as.factor(Instituaion_Code),
+         na.rdw = is.na(RDW)) %>%
+  group_by(inst) %>%
+  summarise(n = n(),
+            s = sum(na.rdw)) %>%
+  View()
+#RDW는 institution마다 측정 유무가 갈림
+```
+
+
+
+```{r}
+#그대로 사용
+hf %>% select(AGE, Ht, Wt, BSA, BMI,
+              
+              SBP, DBP, HR, TC, albumin:glucose, hsCRP_CRP, CK_MB, cTnI, LVEDD:LVEF_vol,
+              LVEF_M:LA_dia, discharge_SBP:discharge_HR, Adm_own, discharge_Na_imm, discharge_K_imm,
+              discharge_UA_imm, discharge_Hb_imm, discharge_BUN_imm, discharge_Cr_imm, discharge_glu_imm,
+              discharge_hsCRP_imm, discharge_CRP_imm, discharge_BNP_imm, discharge_NTpBNP_imm, discharge_CKMB_imm,
+              discharge_TnI_imm, discharge_TnT_imm, discharge_EF_imm, discharge_Bwt_imm, 
+```
+
+
+```{r}
+#사용하는 변수 중 numeric인데 factor로 고쳐야하는 것
+hf %>% select(SEX,
+              HTN:malignancy, firstHTN:CRT_yn, smoking, alcohol, NYHA, Afib_ECG, SR_AF_TM, VT,EKG_Qwave:EKG_IVCD,
+              NoDM_DM_7.0, NP_decile, Etiol_HF, HF_Agg_ACS:HF_Agg_UK, HF_Agg_numb, 
+              med.numb,
+              Med_DM_insulin:Med_DM_meglitinide, Med_DM_num, Med_IV_diuretics:Med_IV_NG, Med_IV_number,
+              IVmed_inotropics, MechVentil, AssDev_number, 
+              renalRT2,
+              transfusion, discharge_date, discharge_state, discharge_NYHA,
+              ICUAdm_times2,
+#              death,
+              Afib,
+              sinus_conv,
+              OtherTreatment3,
+#              cause_of_death
+              )
+```
+
+*파생변수
+```{r}
+#HF_Agg_ACS:HF_Agg_UK는 affravating factor of HF를 dummy var로 나타낸 것. 복합적인 요인이 많아 이렇게 표시함.
+#분석할 때, 이 dummy를 포함시키거나 / 복합 요인 개수(HF_Agg_numb)만 포함시키거나 해야할 듯
+#Med 변수는 어떤 약을 어떤 시기에 얼마나 복용했는지 자잘하게 나타낸 것. 모든 사람이 모든 약을
+#복용하지 않았기 때문에 결측값이 많아 불필요한 변수, 정보를 제거할 필요가 있다. 이를 축소시킨다면, 
+#약을 몇 개 복용해본적 있는지? 어떤 약을 복용했는지가 환자 그룹을 나누는데 유의할까?
+#아니면 얼마나 다양한 약을 복용했는지가 환자 그룹을 나누는데 유의할까?
+med.numb <- hf %>%
+  transmute(Med_ACEI = ifelse(any(Med_ACEI_befAdm==1, Med_ACEI_durAdm==1, Med_ACEI_dis==1), 1, 0),
+         Med_ARB = ifelse(any(Med_ARB_befAdm==1, Med_ARB_durAdm==1, Med_ARB_dis==1), 1, 0),
+         Med_BB = ifelse(any(Med_BB_befAdm==1, Med_BB_durAdm==1, Med_BB_dis==1), 1, 0),
+         Med_AA = ifelse(any(Med_AA_befAdm==1, Med_AA_durAdm==1, Med_AA_dis==1), 1, 0),
+         Med_nitrate = ifelse(Med_nitrate == 3, 0, 1),
+         Med_hydralazine = ifelse(Med_hydralazine ==3, 0, 1),
+         Med_LoopD = ifelse(Med_LoopD==3, 0, 1),
+         Med_Thiazide = ifelse(Med_LoopD==3, 0, 1),
+         Med_Amiodarone = ifelse(Med_Amiodarone==3, 0, 1),
+         Med_digoxin = ifelse(Med_digoxin==3, 0, 1),
+         Med_HepLMWH = ifelse(Med_HepLMWH==3, 0, 1),
+         Med_Warfarin = ifelse(Med_Warfarin==3, 0, 1),
+         Med_asp = ifelse(Med_asp==3, 0, 1),
+         Med_statin = ifelse(Med_statin==3, 0, 1),
+         Med_Ivabradine = ifelse(Med_Ivabradine==3, 0, 1),
+         Med_dronedarone = ifelse(Med_dronedarone==3, 0, 1)) %>%
+  apply(., 1, sum)
+#IVmed_diuretics는 Med_IV_diuretics와 같고, IVmed_vasodilater는 Med_IV_NG와 매우 같다. IVmed_inotropics는
+#변수명만 수정해서 사용.
+#AssistingDev부분은 몇개 device를 사용했는지만 봄. 약과 달리 device는 어떤 장치를 썼는지가 군집에 큰 영향을 
+#안 미칠것 같아서? 일단 여러 방법으로 분석해봐야함.
+#걸러낸 변수의 factor level 통일시켜야함. 1이 사용, 2가 미사용 이런식으로.
+hf %>%
+  mutate(renalf = factor(cbind(renalRT_HD, renalRT_CRRT, renalRT_other) %*% 1:3 +1, labels=1:5)) %>%
+  mutate(renalRT2 = ifelse(renalRT == 1, renalf, 0)) %>%
+  select(renalRT, renalRT2) %>%
+  View()
+#1:HD,CRRT,other 2:CRRT,other 3:HD,CRRT 4:CRRT 5:HD
+hf %>%
+  mutate(ICUAdm_times2 = ifelse(ICUAdm==1, ICUAdm_times, 0))
+
+hf %>%
+  mutate(death = ifelse(death_cause==1, CVdeath, ifelse(death_cause==2, 5, 0)),
+         cause_of_death = ifelse(cause_of_death != 0, cause_of_death, 0))
+#0:alive, 1~4:CVdeath(1~4), 5:death_cause(2)
+
+hf %>%
+  mutate(Afib = ifelse(Afib_duringAdm==1, Afib_type, 0),
+         sinus_conv = ifelse(sinus_conv==1, sinus_conv_type, 0))
+#0:No 1:Paroxysmal 2:Permanent or persistent AF
+#0:No 1:자발적 2:약물사용에 의해서 3:DC cardioversion에 의해서
+
+hf %>%
+  mutate(OtherTreatment2 = factor(as.matrix(hf[,328:336]) %*% 1:9 +1 )) %>%
+  mutate(OtherTreatment3 = ifelse(OtherTreatment==1, OtherTreatment2, 0))
+#9가지 othertreatment를 다양하게 받은 환자 존재. 총 21가지 경우가 있음. 1개 변수로 뭉침
+```
+
+
+```{r}
+#사용하는 변수 중 factor
+hf %>% select(SUBJSTAT, Adm_date, EKG_QRSdur:EKG_HR, WBC:Platelet, )
+```
+
+
+```{r}
+#결측치가 많지만 유진썜이 사용한 변수 - imputation 어떻게?
+hf %>% select(New_Afib, VT_type, pacing, No_BBB, No_wide_QRS:ETC_No_BBB, HbA1c, HbA1c_7_new, TG, LDLcal,
+              BNP:NTproBNP_decile, cTnT, LVEF_vis, LAVI, E_wave:E_over_Eprime, ActiveBleed, )
+```
+
+
+```{r}
+#다음 세가지 날짜 변수는 거의 비슷한 날. Adm_date만 일단 사용. 정확히 얼마나 비슷? 차이가 있다면 파생변수로
+#활용가능한지?
+hf %>% select(Adm_date, Dx_date, EKG_date, lab_date, Echo_date, base_DC_dt, FU_date, DCDT) %>% View('a')
+dmy(hf$EKG_date)
+```
+
+
+```{r}
+hf %>%
+  select(Adm_fee_perday, Adm_fee_own_perday, Adm_fee, Adm_fee_own) %>%
+  melt(.) %>%
+  ggplot(., aes(x=log(value), fill=variable)) +
+  geom_density(alpha=.2)
+
+hf %>%
+  select(Adm_fee, Adm_fee_own) %>%
+  melt(.) %>%
+  ggplot(., aes(x=variable, y=log(value)))+
+  geom_boxplot()
+```
+
+
+
+
+
+
+
+
+
+
+
+
